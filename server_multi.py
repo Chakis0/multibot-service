@@ -112,39 +112,70 @@ def attach_handlers(bot_key: str, bot: telebot.TeleBot):
         if not has_access(bot_key, message.chat.id):
             bot.send_message(message.chat.id, "⛔ У вас нет доступа")
             return
+
         if message.chat.id not in last_link_msg[bot_key]:
             bot.send_message(message.chat.id, "⚠️ Нет последнего платежа для редактирования")
             return
+
         try:
             raw = message.text[len("/info"):].strip()
-            if "|" not in raw:
-                extra_block = f"\n────────────────\nКомментарий:\n{raw}\n────────────────"
-            else:
-                parts = [p.strip() for p in raw.split("|")]
-                trader  = parts[0] if len(parts) > 0 else ""
-                details = parts[1] if len(parts) > 1 else ""
-                tm      = parts[2] if len(parts) > 2 else ""
-                amt     = parts[3] if len(parts) > 3 else ""
-                lines = []
-                if trader:  lines.append(f"Трейдер: {trader}")
-                if details: lines.append(f"Реквизит: {details}")
-                if tm:      lines.append(f"Время: {tm}")
-                if amt:     lines.append(f"Сумма: {amt}")
-                body = "\n".join(lines) if lines else "(нет данных)"
-                extra_block = f"\n────────────────\n{body}\n────────────────"
+            # Свободный текст, без форматов и без разделителей
+            extra = ("
+" + raw) if raw else ""
+            base = last_link_msg[bot_key][message.chat.id].get("base_text", "")
+            new_text = base + extra
 
-            new_text = last_link_msg[bot_key][message.chat.id]["base_text"] + extra_block
             bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id= last_link_msg[bot_key][message.chat.id]["message_id"],
                 text=new_text,
                 disable_web_page_preview=True
             )
+            last_link_msg[bot_key][message.chat.id]["base_text"] = new_text
         except Exception as e:
-            bot.send_message(
-                message.chat.id,
-                f"⚠️ Ошибка: {e}\n\nФорматы:\n/info свободный текст\n/info трейдер | реквизит | время | сумма"
-            )
+            bot.send_message(message.chat.id, f"⚠️ Ошибка при редактировании: {e}")
+
+    @bot.message_handler(commands=['link'])
+    def set_link(message):
+        if not has_access(bot_key, message.chat.id):
+            bot.send_message(message.chat.id, "⛔ У вас нет доступа")
+            return
+        parts = message.text.split(maxsplit=1)
+        if len(parts) < 2:
+            bot.send_message(message.chat.id, "⚠️ Используй: /link <url> [любой текст]")
+            return
+        tail = parts[1].strip()
+        url = tail.split()[0]
+        comment = tail[len(url):].strip()
+        if not (url.startswith("http://") or url.startswith("https://")):
+            bot.send_message(message.chat.id, "⚠️ Укажи корректный URL, начинающийся с http(s)://")
+            return
+
+        text = f"💳 Ссылка на оплату:
+{url}"
+        if comment:
+            text += "
+" + comment
+
+        try:
+            if message.chat.id in last_link_msg[bot_key]:
+                bot.edit_message_text(
+                    chat_id=message.chat.id,
+                    message_id= last_link_msg[bot_key][message.chat.id]["message_id"],
+                    text=text,
+                    disable_web_page_preview=True
+                )
+                last_link_msg[bot_key][message.chat.id]["base_text"] = text
+            else:
+                msg = bot.send_message(message.chat.id, text, disable_web_page_preview=True)
+                last_link_msg[bot_key][message.chat.id] = {
+                    "message_id": msg.message_id,
+                    "order_id": "",
+                    "base_text": text,
+                }
+            bot.send_message(message.chat.id, "✅ Ссылка обновлена")
+        except Exception as e:
+            bot.send_message(message.chat.id, f"⚠️ Не удалось обновить ссылку: {e}")
 
     @bot.message_handler(commands=['add'])
     def add_user(message):
@@ -189,12 +220,18 @@ def attach_handlers(bot_key: str, bot: telebot.TeleBot):
 
     @bot.callback_query_handler(func=lambda call: True)
     def callback(call):
+        # Всегда быстро подтверждаем callback, иначе Telegram ругается "query is too old"
+        try:
+            bot.answer_callback_query(call.id)
+        except Exception:
+            pass
+
         if not has_access(bot_key, call.message.chat.id):
-            bot.answer_callback_query(call.id, "⛔ У вас нет доступа")
             return
+
         if call.data == "wake_up":
-            bot.answer_callback_query(call.id, "Я на связи ✅")
             return
+
         if call.data == "pay_custom":
             msg = bot.send_message(call.message.chat.id, "Введи сумму в рублях (200–85000):")
             bot.register_next_step_handler(msg, handle_custom_amount)
@@ -213,10 +250,8 @@ def attach_handlers(bot_key: str, bot: telebot.TeleBot):
             link = result.get("payment_link")
             oid  = result.get("order_id")
 
-            text = (
-                f"💳 Ссылка на оплату ({fmt_rub(amt)} ₽):\n{link}\n\n"
-                f"────────────────"
-            )
+            text = f"💳 Ссылка на оплату ({fmt_rub(amt)} ₽):
+{link}"
             msg = bot.send_message(message.chat.id, text, disable_web_page_preview=True)
 
             last_link_msg[bot_key][message.chat.id] = {
@@ -224,7 +259,6 @@ def attach_handlers(bot_key: str, bot: telebot.TeleBot):
                 "order_id": oid,
                 "base_text": text
             }
-            # сохраняем маппинг для /webhook
             order_map[oid] = {
                 "bot_key": bot_key,
                 "chat_id": message.chat.id,
@@ -233,7 +267,8 @@ def attach_handlers(bot_key: str, bot: telebot.TeleBot):
         except ValueError:
             bot.send_message(message.chat.id, "Введите целое число без копеек.")
         except Exception as e:
-            bot.send_message(message.chat.id, f"Ошибка при создании платежа ❌\n{e}")
+            bot.send_message(message.chat.id, f"Ошибка при создании платежа ❌
+{e}")
 
 # =============================
 # HTTP session with retries (Nicepay)
