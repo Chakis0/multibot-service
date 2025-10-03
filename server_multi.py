@@ -236,6 +236,22 @@ def attach_handlers(bot_key: str, bot: telebot.TeleBot):
             bot.send_message(message.chat.id, f"Ошибка при создании платежа ❌\n{e}")
 
 # =============================
+# HTTP session with retries (Nicepay)
+# =============================
+from requests.adapters import HTTPAdapter, Retry
+
+_session = requests.Session()
+_retries = Retry(
+    total=3,
+    connect=3,
+    read=3,
+    backoff_factor=0.7,  # ~0.7s, 1.4s, 2.1s
+    status_forcelist=[429, 500, 502, 503, 504],
+    allowed_methods=["POST"],
+)
+_session.mount("https://", HTTPAdapter(max_retries=_retries))
+
+# =============================
 # Payment core (per-bot merchant)
 # =============================
 
@@ -266,7 +282,12 @@ def create_payment_core(bot_key: str, amount: int, chat_id: int, currency: str =
         "description": f"Top up from Telegram bot ({bot_key})",
     }
     try:
-        r = requests.post("https://nicepay.io/public/api/payment", json=payload, timeout=25)
+        # Separate connect/read timeouts; give read more headroom
+        r = _session.post(
+            "https://nicepay.io/public/api/payment",
+            json=payload,
+            timeout=(5, 45),  # 5s connect, 45s read
+        )
         data = r.json()
     except Exception as e:
         raise HTTPException(502, f"Nicepay request failed: {e}")
