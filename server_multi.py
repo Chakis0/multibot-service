@@ -242,14 +242,14 @@ from requests.adapters import HTTPAdapter, Retry
 
 _session = requests.Session()
 _retries = Retry(
-    total=3,
-    connect=3,
-    read=3,
-    backoff_factor=0.7,  # ~0.7s, 1.4s, 2.1s
+    total=5,
+    connect=5,
+    read=5,
+    backoff_factor=0.8,  # 0.8s, 1.6s, 3.2s, 6.4s, 12.8s
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["POST"],
 )
-_session.mount("https://", HTTPAdapter(max_retries=_retries))
+_session.mount("https://", HTTPAdapter(max_retries=_retries, pool_maxsize=20))
 
 # =============================
 # Payment core (per-bot merchant)
@@ -286,7 +286,7 @@ def create_payment_core(bot_key: str, amount: int, chat_id: int, currency: str =
         r = _session.post(
             "https://nicepay.io/public/api/payment",
             json=payload,
-            timeout=(5, 45),  # 5s connect, 45s read
+            timeout=(12, 60),  # 5s connect, 45s read
         )
         data = r.json()
     except Exception as e:
