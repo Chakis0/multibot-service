@@ -117,34 +117,21 @@ def attach_handlers(bot_key: str, bot: telebot.TeleBot):
             return
         try:
             raw = message.text[len("/info"):].strip()
-            if "|" not in raw:
-                extra_block = f"\n────────────────\nКомментарий:\n{raw}\n────────────────"
-            else:
-                parts = [p.strip() for p in raw.split("|")]
-                trader  = parts[0] if len(parts) > 0 else ""
-                details = parts[1] if len(parts) > 1 else ""
-                tm      = parts[2] if len(parts) > 2 else ""
-                amt     = parts[3] if len(parts) > 3 else ""
-                lines = []
-                if trader:  lines.append(f"Трейдер: {trader}")
-                if details: lines.append(f"Реквизит: {details}")
-                if tm:      lines.append(f"Время: {tm}")
-                if amt:     lines.append(f"Сумма: {amt}")
-                body = "\n".join(lines) if lines else "(нет данных)"
-                extra_block = f"\n────────────────\n{body}\n────────────────"
-
-            new_text = last_link_msg[bot_key][message.chat.id]["base_text"] + extra_block
+            # Свободный текст без форматов и разделителей; если пусто — ничего не делаем
+            if not raw:
+                return
+            base = last_link_msg[bot_key][message.chat.id].get("base_text", "")
+            new_text = base + "
+" + raw
             bot.edit_message_text(
                 chat_id=message.chat.id,
                 message_id= last_link_msg[bot_key][message.chat.id]["message_id"],
                 text=new_text,
                 disable_web_page_preview=True
             )
+            last_link_msg[bot_key][message.chat.id]["base_text"] = new_text
         except Exception as e:
-            bot.send_message(
-                message.chat.id,
-                f"⚠️ Ошибка: {e}\n\nФорматы:\n/info свободный текст\n/info трейдер | реквизит | время | сумма"
-            )
+            bot.send_message(message.chat.id, f"⚠️ Ошибка при редактировании: {e}")
 
     @bot.message_handler(commands=['add'])
     def add_user(message):
@@ -188,8 +175,8 @@ def attach_handlers(bot_key: str, bot: telebot.TeleBot):
         bot.send_message(message.chat.id, "Нажми «Оплатить», затем введи сумму (200–85000 ₽).", reply_markup=kb)
 
     @bot.callback_query_handler(func=lambda call: True)
-def callback(call):
-        # Всегда быстро подтверждаем callback, иначе Telegram ругается "query is too old"
+    def callback(call):
+        # Быстро подтверждаем callback, чтобы Telegram не ругался "query is too old"
         try:
             bot.answer_callback_query(call.id)
         except Exception:
@@ -206,7 +193,7 @@ def callback(call):
             bot.register_next_step_handler(msg, handle_custom_amount)
             return
 
-def handle_custom_amount(message):
+    def handle_custom_amount(message):(message):
         if not has_access(bot_key, message.chat.id):
             bot.send_message(message.chat.id, "⛔ У вас нет доступа")
             return
@@ -219,10 +206,8 @@ def handle_custom_amount(message):
             link = result.get("payment_link")
             oid  = result.get("order_id")
 
-            text = (
-                f"💳 Ссылка на оплату ({fmt_rub(amt)} ₽):\n{link}\n\n"
-                f"────────────────"
-            )
+            text = f"💳 Ссылка на оплату ({fmt_rub(amt)} ₽):
+{link}"
             msg = bot.send_message(message.chat.id, text, disable_web_page_preview=True)
 
             last_link_msg[bot_key][message.chat.id] = {
