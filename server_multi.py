@@ -8,13 +8,15 @@ from collections import defaultdict
 from typing import Dict, Any
 
 import requests
+from requests.adapters import HTTPAdapter, Retry
 from fastapi import FastAPI, Request, HTTPException, Header
 from fastapi.responses import JSONResponse
 import telebot
 from telebot import types
 
+
 # =============================
-# Config & Helpers
+# Config helpers
 # =============================
 
 def env_json(name: str, default: Dict[str, Any] | None = None) -> Dict[str, Any]:
@@ -26,48 +28,49 @@ def env_json(name: str, default: Dict[str, Any] | None = None) -> Dict[str, Any]
     except Exception:
         return default or {}
 
-PUBLIC_BASE_URL   = os.getenv("PUBLIC_BASE_URL", "")
-BOT_KEYS_CSV      = os.getenv("BOT_KEYS", "").strip()
-BOT_KEYS          = [k.strip() for k in BOT_KEYS_CSV.split(",") if k.strip()]
 
-TELEGRAM_TOKENS   = env_json("TELEGRAM_TOKENS")          # {bot_key: token}
-TG_WEBHOOK_SECRETS= env_json("TG_WEBHOOK_SECRETS")       # {bot_key: secret}
-MERCHANT_IDS      = env_json("MERCHANT_IDS")             # {bot_key: merchant_id}
-SECRET_KEYS       = env_json("SECRET_KEYS")              # {bot_key: nicepay_secret}
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
+BOT_KEYS_CSV = os.getenv("BOT_KEYS", "").strip()
+BOT_KEYS = [k.strip() for k in BOT_KEYS_CSV.split(",") if k.strip()]
 
-# Базовый whitelist общий для всех ботов (можно кастомизировать per-bot, если нужно)
+TELEGRAM_TOKENS = env_json("TELEGRAM_TOKENS")        # {bot_key: token}
+TG_WEBHOOK_SECRETS = env_json("TG_WEBHOOK_SECRETS")  # {bot_key: secret} (можно пустым)
+MERCHANT_IDS = env_json("MERCHANT_IDS")              # {bot_key: merchant_id}
+SECRET_KEYS = env_json("SECRET_KEYS")                # {bot_key: nicepay_secret}
+
+# Базовый whitelist общий для всех ботов
 BASE_WHITELIST = {958579430, 8051914154, 2095741832, 7167283179}
 
-# Проверки конфигурации
 if not BOT_KEYS:
-    raise RuntimeError("BOT_KEYS пуст. Укажи список ключей ботов через запятую, например 'bot1,bot2'.")
+    raise RuntimeError("BOT_KEYS пуст. Укажи список ключей через запятую (например: 'bot1,bot2').")
 
 for k in BOT_KEYS:
     if k not in TELEGRAM_TOKENS:
         raise RuntimeError(f"TELEGRAM_TOKENS не содержит токен для '{k}'")
-    if k not in TG_WEBHOOK_SECRETS:
-        # Не критично, но рекомендуем задать
-        TG_WEBHOOK_SECRETS[k] = os.getenv("TG_WEBHOOK_SECRET", "")
     if k not in MERCHANT_IDS:
         raise RuntimeError(f"MERCHANT_IDS не содержит merchant_id для '{k}'")
     if k not in SECRET_KEYS:
         raise RuntimeError(f"SECRET_KEYS не содержит nicepay secret для '{k}'")
+    # если нет индивидуального секрета вебхука — используем глобальный, если задан
+    if k not in TG_WEBHOOK_SECRETS:
+        TG_WEBHOOK_SECRETS[k] = os.getenv("TG_WEBHOOK_SECRET", "")
+
 
 # =============================
 # App & State
 # =============================
 app = FastAPI()
 
-# Словарь ботов: bot_key -> TeleBot
+# bot_key -> TeleBot
 bots: Dict[str, telebot.TeleBot] = {}
 
-# Память для последних сообщений со ссылкой: {bot_key: {chat_id: {...}}}
+# last link messages: {bot_key: {chat_id: {...}}}
 last_link_msg: Dict[str, Dict[int, Dict[str, Any]]] = defaultdict(dict)
 
-# Маппинг order_id -> (bot_key, chat_id, message_id)
+# order_id -> (bot_key, chat_id, message_id)
 order_map: Dict[str, Dict[str, Any]] = {}
 
-# Динамический whitelist per-bot: файлы whitelist_<bot_key>.json рядом с приложением
+# Dynamic whitelists per bot
 WHITELIST_DIR = Path("whitelists")
 WHITELIST_DIR.mkdir(exist_ok=True)
 
@@ -88,18 +91,16 @@ def save_dynamic_whitelist(bot_key: str, ids: set[int]) -> None:
 
 DYNAMIC_WHITELISTS: Dict[str, set[int]] = {k: load_dynamic_whitelist(k) for k in BOT_KEYS}
 
-
 def has_access(bot_key: str, chat_id: int) -> bool:
     return (chat_id in BASE_WHITELIST) or (chat_id in DYNAMIC_WHITELISTS.get(bot_key, set()))
-
 
 def fmt_rub(amount_int: int) -> str:
     return f"{amount_int:,}".replace(",", " ")
 
-# =============================
-# Bot factory (handlers per bot)
-# =============================
 
+# =============================
+# Bot handlers per bot
+# =============================
 def attach_handlers(bot_key: str, bot: telebot.TeleBot):
     """Регистрирует хендлеры команд и колбеков для конкретного бота."""
 
@@ -117,15 +118,12 @@ def attach_handlers(bot_key: str, bot: telebot.TeleBot):
             return
         try:
             raw = message.text[len("/info"):].strip()
-            # Свободный текст без форматов и разделителей; если пусто — ничего не делаем
-            if not raw:
-                return
+            # Свободный текст без форматов; если пусто — ничего не делаем
             base = last_link_msg[bot_key][message.chat.id].get("base_text", "")
-            new_text = base + "
-" + raw
+            new_text = base + ("\n" + raw if raw else "")
             bot.edit_message_text(
                 chat_id=message.chat.id,
-                message_id= last_link_msg[bot_key][message.chat.id]["message_id"],
+                message_id=last_link_msg[bot_key][message.chat.id]["message_id"],
                 text=new_text,
                 disable_web_page_preview=True
             )
@@ -193,7 +191,7 @@ def attach_handlers(bot_key: str, bot: telebot.TeleBot):
             bot.register_next_step_handler(msg, handle_custom_amount)
             return
 
-    def handle_custom_amount(message):(message):
+    def handle_custom_amount(message):
         if not has_access(bot_key, message.chat.id):
             bot.send_message(message.chat.id, "⛔ У вас нет доступа")
             return
@@ -202,12 +200,12 @@ def attach_handlers(bot_key: str, bot: telebot.TeleBot):
             if amt < 200 or amt > 85000:
                 bot.send_message(message.chat.id, "Сумма вне лимитов Nicepay (200–85000 ₽).")
                 return
+
             result = create_payment_core(bot_key, amt, message.chat.id, "RUB")
             link = result.get("payment_link")
-            oid  = result.get("order_id")
+            oid = result.get("order_id")
 
-            text = f"💳 Ссылка на оплату ({fmt_rub(amt)} ₽):
-{link}"
+            text = f"💳 Ссылка на оплату ({fmt_rub(amt)} ₽):\n{link}"
             msg = bot.send_message(message.chat.id, text, disable_web_page_preview=True)
 
             last_link_msg[bot_key][message.chat.id] = {
@@ -215,7 +213,6 @@ def attach_handlers(bot_key: str, bot: telebot.TeleBot):
                 "order_id": oid,
                 "base_text": text
             }
-            # сохраняем маппинг для /webhook
             order_map[oid] = {
                 "bot_key": bot_key,
                 "chat_id": message.chat.id,
@@ -226,26 +223,25 @@ def attach_handlers(bot_key: str, bot: telebot.TeleBot):
         except Exception as e:
             bot.send_message(message.chat.id, f"Ошибка при создании платежа ❌\n{e}")
 
+
 # =============================
 # HTTP session with retries (Nicepay)
 # =============================
-from requests.adapters import HTTPAdapter, Retry
-
 _session = requests.Session()
 _retries = Retry(
     total=5,
     connect=5,
     read=5,
-    backoff_factor=0.8,  # 0.8s, 1.6s, 3.2s, 6.4s, 12.8s
+    backoff_factor=0.8,              # ~0.8s, 1.6s, 3.2s, 6.4s, 12.8s
     status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["POST"],
 )
 _session.mount("https://", HTTPAdapter(max_retries=_retries, pool_maxsize=20))
 
+
 # =============================
 # Payment core (per-bot merchant)
 # =============================
-
 def create_payment_core(bot_key: str, amount: int, chat_id: int, currency: str = "RUB") -> Dict[str, Any]:
     if currency == "RUB":
         if amount < 200 or amount > 85000:
@@ -273,11 +269,11 @@ def create_payment_core(bot_key: str, amount: int, chat_id: int, currency: str =
         "description": f"Top up from Telegram bot ({bot_key})",
     }
     try:
-        # Separate connect/read timeouts; give read more headroom
+        # Раздельные таймауты: 12s на connect, 60s на read
         r = _session.post(
             "https://nicepay.io/public/api/payment",
             json=payload,
-            timeout=(12, 60),  # 5s connect, 45s read
+            timeout=(12, 60),
         )
         data = r.json()
     except Exception as e:
@@ -292,21 +288,19 @@ def create_payment_core(bot_key: str, amount: int, chat_id: int, currency: str =
         msg = (data.get("data") or {}).get("message", "Unknown Nicepay error")
         raise HTTPException(400, f"Nicepay error: {msg}")
 
+
 # =============================
 # HTTP endpoints
 # =============================
-
 @app.get("/health")
 def health():
     return {"ok": True, "bots": BOT_KEYS}
 
 @app.post("/tg-webhook/{bot_key}")
 async def tg_webhook(bot_key: str, request: Request, x_telegram_bot_api_secret_token: str = Header(None)):
-    # Проверяем, что такой бот существует
     if bot_key not in bots:
         return JSONResponse({"ok": True}, status_code=200)
 
-    # Проверяем секрет (если задан)
     expected = TG_WEBHOOK_SECRETS.get(bot_key) or os.getenv("TG_WEBHOOK_SECRET", "")
     if expected and x_telegram_bot_api_secret_token != expected:
         # молча игнорируем, но 200 OK, чтобы TG не ретраил
@@ -327,13 +321,12 @@ async def nicepay_webhook(request: Request):
     if not received_hash:
         raise HTTPException(400, "hash missing")
 
-    # Определяем bot_key: берём из order_id, формат: <bot_key>-<chat_id>-<uuid8>
     order_id = params.get("order_id", "")
     bot_key = order_id.split("-", 1)[0] if "-" in order_id else None
     if not bot_key or bot_key not in SECRET_KEYS:
         raise HTTPException(400, "unknown bot_key in order_id")
 
-    # Хэш по правилам Nicepay: сортируем все поля (уже без hash), склеиваем значения через {np}, в конец SECRET_KEY
+    # Nicepay hash: отсортированные значения + SECRET_KEY[bot_key]
     base = "{np}".join([v for _, v in sorted(params.items(), key=lambda x: x[0])] + [SECRET_KEYS[bot_key]])
     calc_hash = hashlib.sha256(base.encode()).hexdigest()
     if calc_hash != received_hash:
@@ -357,7 +350,6 @@ async def nicepay_webhook(request: Request):
     amount_human = minor_to_human(amount_str, amount_cur)
     profit_human = minor_to_human(profit_str, profit_cur) if profit_str is not None else None
 
-    # chat_id берём из order_id
     chat_id = None
     try:
         parts = order_id.split("-")
@@ -367,7 +359,6 @@ async def nicepay_webhook(request: Request):
         pass
 
     if result == "success" and chat_id is not None:
-        # Отправляем в нужного бота
         try:
             b = bots.get(bot_key)
             if b:
@@ -387,15 +378,15 @@ def create_payment(amount: int, chat_id: int, currency: str = "RUB", bot_key: st
         raise HTTPException(400, "unknown or missing bot_key")
     return create_payment_core(bot_key, amount, chat_id, currency)
 
+
 # =============================
 # Bootstrap: init all bots
 # =============================
 for k in BOT_KEYS:
-    tkn = TELEGRAM_TOKENS[k]
-    b = telebot.TeleBot(tkn, threaded=False)
+    token = TELEGRAM_TOKENS[k]
+    b = telebot.TeleBot(token, threaded=False)
     attach_handlers(k, b)
     bots[k] = b
 
-# Готово: теперь вебхуки ставим на /tg-webhook/<bot_key>
-# Пример setWebhook для bot1:
-# https://api.telegram.org/bot<TOKEN_bot1>/setWebhook?url=<PUBLIC_BASE_URL>/tg-webhook/bot1&secret_token=<SECRET_bot1>
+# Вебхуки нужно ставить так (для справки):
+# https://api.telegram.org/bot<TOKEN_botX>/setWebhook?url=<PUBLIC_BASE_URL>/tg-webhook/<bot_key>&secret_token=<SECRET_for_bot_key>
